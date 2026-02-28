@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>機密掲示板ターミナル</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, onAuthStateChanged, signInWithCustomToken } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, collection, addDoc, onSnapshot, doc, deleteDoc, serverTimestamp, query, orderBy } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // Firebase設定の取得
+        const firebaseConfig = JSON.parse(__firebase_config);
+        const app = initializeApp(firebaseConfig);
+        const auth = getAuth(app);
+        const db = getFirestore(app);
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'private-bbs-app';
+
+        // 状態管理
+        let isAdmin = false;
+        let isSubmitting = false;
+        const ADMIN_PASSWORD = "wolfwolf";
+
+        // DOM要素
+        const postsContainer = document.getElementById('posts-container');
+        const postFormWrapper = document.getElementById('post-form-wrapper');
+        const postForm = document.getElementById('post-form');
+        const adminSection = document.getElementById('admin-section');
+        const adminLoginBtn = document.getElementById('admin-login-btn');
+        const passwordInput = document.getElementById('admin-password');
+        const logoutBtn = document.getElementById('logout-btn');
+        const statusMsg = document.getElementById('status-msg');
+        const submitBtn = document.getElementById('submit-btn');
+        const systemLog = document.getElementById('system-log');
+
+        // マトリックス背景
+        const canvas = document.getElementById('matrix-bg');
+        const ctx = canvas.getContext('2d');
+        let width, height, columns, drops;
+        
+        function initMatrix() {
+            width = canvas.width = window.innerWidth;
+            height = canvas.height = window.innerHeight;
+            columns = Math.floor(width / 14);
+            drops = Array(columns).fill(1);
+        }
+        initMatrix();
+        window.addEventListener('resize', initMatrix);
+
+        const letters = '01ｱｲｳｴｵｶｷｸｹｺｻｼｽｾｿﾀﾁﾂﾃﾄﾅﾆﾇﾈﾉﾊﾋﾌﾍﾎﾏﾐﾑﾒﾓﾔﾕﾖﾗﾘﾙﾚﾛﾜﾝ';
+        function drawMatrix() {
+            ctx.fillStyle = 'rgba(0, 0, 0, 0.1)';
+            ctx.fillRect(0, 0, width, height);
+            ctx.fillStyle = '#0F0';
+            ctx.font = '14px monospace';
+            for (let i = 0; i < drops.length; i++) {
+                const text = letters.charAt(Math.floor(Math.random() * letters.length));
+                ctx.fillText(text, i * 14, drops[i] * 14);
+                if (drops[i] * 14 > height && Math.random() > 0.975) drops[i] = 0;
+                drops[i]++;
+            }
+        }
+        setInterval(drawMatrix, 35);
+
+        function printLog(msg) {
+            systemLog.textContent = `> ${msg}`;
+        }
+
+        // 投稿の読み込み (認証後に呼び出す)
+        let unsubscribePosts = null;
+        function loadPosts(user) {
+            if (!user) return;
+            printLog("データ同期中...");
+            
+            // シンプルなクエリ (Rule 2: 複合クエリを避ける)
+            const q = collection(db, 'artifacts', appId, 'public', 'data', 'posts');
+            
+            if (unsubscribePosts) unsubscribePosts();
+
+            unsubscribePosts = onSnapshot(q, (snapshot) => {
+                postsContainer.innerHTML = '';
+                
+                // メモリ内でソート
+                const sortedDocs = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }))
+                    .sort((a, b) => {
+                        const timeA = a.createdAt?.toMillis ? a.createdAt.toMillis() : (a.createdAt?.seconds * 1000 || 0);
+                        const timeB = b.createdAt?.toMillis ? b.createdAt.toMillis() : (b.createdAt?.seconds * 1000 || 0);
+                        return timeB - timeA;
+                    });
+
+                if (sortedDocs.length === 0) {
+                    postsContainer.innerHTML = '<div class="text-center py-20 text-green-900 font-mono">>> 掲示されている内容はありません。</div>';
+                    return;
+                }
+
+                sortedDocs.forEach((post, index) => {
+                    const timestamp = post.createdAt?.toMillis ? post.createdAt.toMillis() : (post.createdAt?.seconds * 1000 || null);
+                    const date = timestamp ? new Date(timestamp).toLocaleString('ja-JP') : '...';
+                    const postNum = sortedDocs.length - index;
+                    
+                    const postEl = document.createElement('div');
+                    postEl.className = "bg-black/80 backdrop-blur-md p-6 border-l-4 border-green-500 shadow-lg mb-8 animate-fade-in relative";
+                    postEl.innerHTML = `
+                        <div class="flex justify-between items-center mb-2 text-[11px] font-mono text-green-700 border-b border-green-900 pb-1">
+                            <span>No.${postNum}</span>
+                            <span>投稿日: ${date}</span>
+                        </div>
+                        <h3 class="text-lg font-bold text-green-400 mb-3">【${post.title}】</h3>
+                        <p class="text-green-100 whitespace-pre-wrap leading-relaxed text-sm mb-4 font-mono">${post.content}</p>
+                        ${isAdmin ? `
+                            <div class="flex justify-end pt-2">
+                                <button class="delete-trigger text-[10px] text-red-900 hover:text-red-500 border border-red-900 px-3 py-1 transition hover:bg-red-950/30">
+                                    [ 消去 ]
+                                </button>
+                            </div>
+                        ` : ''}
+                    `;
+                    
+                    if (isAdmin) {
+                        const delBtn = postEl.querySelector('.delete-trigger');
+                        delBtn.addEventListener('click', async () => {
+                            if (delBtn.textContent.includes('確認')) {
+                                delBtn.disabled = true;
+                                delBtn.textContent = "[ 処理中... ]";
+                                try {
+                                    await deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'posts', post.id));
+                                    printLog("ドキュメントを永久削除しました。");
+                                } catch (e) {
+                                    printLog("削除エラーが発生しました。");
+                                }
+                            } else {
+                                delBtn.textContent = '[ 本当に削除しますか？ ]';
+                                delBtn.classList.add('text-red-500', 'border-red-500');
+                                setTimeout(() => {
+                                    if(delBtn) {
+                                        delBtn.textContent = '[ 消去 ]';
+                                        delBtn.classList.remove('text-red-500', 'border-red-500');
+                                    }
+                                }, 4000);
+                            }
+                        });
+                    }
+                    postsContainer.appendChild(postEl);
+                });
+                printLog("掲示板データを更新しました。");
+            }, (err) => {
+                printLog("同期エラーが発生しました。");
+                console.error(err);
+            });
+        }
+
+        // 初期認証フロー (Rule 3)
+        async function startApp() {
+            printLog("システム認証を開始...");
+            try {
+                if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                    await signInWithCustomToken(auth, __initial_auth_token);
+                } else {
+                    await signInAnonymously(auth);
+                }
+            } catch (error) {
+                printLog("認証サーバーに接続できません。");
+                console.error(error);
+            }
+        }
+
+        onAuthStateChanged(auth, (user) => {
+            if (user) {
+                printLog("アクセス承認。データの取得を開始します。");
+                loadPosts(user);
+            } else {
+                printLog("セッションが切断されました。");
+            }
+        });
+
+        // ログイン処理
+        adminLoginBtn.addEventListener('click', () => {
+            if (passwordInput.value === ADMIN_PASSWORD) {
+                isAdmin = true;
+                postFormWrapper.classList.remove('hidden');
+                adminSection.classList.add('hidden');
+                logoutBtn.classList.remove('hidden');
+                statusMsg.textContent = "管理者認証完了 (Root Access)";
+                statusMsg.className = "text-xs font-bold text-green-400 uppercase tracking-widest blinking-cursor";
+                passwordInput.value = "";
+                printLog("管理者権限を取得。書き込みモードへ移行。");
+                loadPosts(auth.currentUser);
+                postFormWrapper.scrollIntoView({ behavior: 'smooth' });
+            } else {
+                passwordInput.value = "";
+                printLog("パスワード不一致。アクセス権限がありません。");
+            }
+        });
+
+        logoutBtn.addEventListener('click', () => {
+            isAdmin = false;
+            postFormWrapper.classList.add('hidden');
+            adminSection.classList.remove('hidden');
+            logoutBtn.classList.add('hidden');
+            statusMsg.textContent = "閲覧専用モード";
+            statusMsg.className = "text-xs font-bold text-gray-600 uppercase tracking-widest blinking-cursor";
+            printLog("ログアウトしました。読み取り専用に戻ります。");
+            loadPosts(auth.currentUser);
+            window.scrollTo({ top: 0, behavior: 'smooth' });
+        });
+
+        // 投稿処理
+        postForm.addEventListener('submit', async (event) => {
+            event.preventDefault();
+            if (!isAdmin || !auth.currentUser || isSubmitting) return;
+
+            const titleInput = document.getElementById('post-title');
+            const contentInput = document.getElementById('post-content');
+            const title = titleInput.value.trim();
+            const content = contentInput.value.trim();
+
+            if (!title || !content) return;
+
+            isSubmitting = true;
+            submitBtn.disabled = true;
+            submitBtn.textContent = "[ 通信中... ]";
+
+            try {
+                // Rule 1: パスの厳守
+                await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'posts'), {
+                    title,
+                    content,
+                    createdAt: serverTimestamp()
+                });
+                postForm.reset();
+                printLog("新規記事の登録に成功しました。");
+            } catch (error) {
+                printLog("書き込み失敗。権限を確認してください。");
+                console.error(error);
+            } finally {
+                isSubmitting = false;
+                submitBtn.disabled = false;
+                submitBtn.textContent = "[ 掲示板に書き込む ]";
+            }
+        });
+
+        // 実行開始
+        startApp();
+    </script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=DotGothic16&display=swap');
+        body { background-color: #000; font-family: 'DotGothic16', sans-serif; color: #0F0; }
+        .crt-overlay {
+            background: linear-gradient(rgba(18, 16, 16, 0) 50%, rgba(0, 0, 0, 0.05) 50%), linear-gradient(90deg, rgba(255, 0, 0, 0.02), rgba(0, 255, 0, 0.01), rgba(0, 0, 255, 0.02));
+            background-size: 100% 3px, 3px 100%;
+            pointer-events: none;
+            position: fixed; inset: 0; z-index: 50;
+        }
+        .blinking-cursor::after { content: '_'; animation: blink 1s step-end infinite; }
+        @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
+        .animate-fade-in { animation: fadeIn 0.4s ease-out; }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+        input, textarea { background: rgba(0, 20, 0, 0.5) !important; }
+    </style>
+</head>
+<body class="min-h-screen flex flex-col relative overflow-x-hidden selection:bg-green-800 selection:text-white">
+    <canvas id="matrix-bg" class="fixed inset-0 z-0 opacity-20"></canvas>
+    <div class="crt-overlay"></div>
+
+    <div class="relative z-10 max-w-2xl mx-auto px-4 py-10 w-full flex-grow">
+        <!-- ヘッダー -->
+        <header class="mb-8 text-center border-2 border-green-500 p-6 bg-black/90 shadow-[0_0_15px_rgba(0,255,0,0.2)]">
+            <h1 class="text-2xl md:text-4xl font-black tracking-[0.3em] text-green-400 mb-4 drop-shadow-[0_0_8px_rgba(0,255,0,0.5)]">
+                機密掲示板ターミナル
+            </h1>
+            <div class="flex justify-center items-center gap-4">
+                <span id="status-msg" class="text-xs font-bold text-gray-600 uppercase tracking-widest blinking-cursor">閲覧専用モード</span>
+                <button id="logout-btn" class="hidden text-[10px] border border-green-500 px-3 py-1 hover:bg-green-500 hover:text-black transition">
+                    ログアウト
+                </button>
+            </div>
+        </header>
+
+        <!-- ログ -->
+        <div class="bg-black/80 border border-green-900 p-3 mb-8 text-[10px] text-green-700 font-mono flex items-center gap-2">
+            <span class="animate-pulse">●</span>
+            <span id="system-log">> システムを初期化しました。</span>
+        </div>
+
+        <!-- 掲示板メイン -->
+        <div id="posts-container" class="space-y-6">
+            <div class="text-center py-20 text-green-900 animate-pulse">同期中...</div>
+        </div>
+
+        <!-- 投稿フォーム (管理者の時だけ表示) -->
+        <section id="post-form-wrapper" class="hidden my-12 p-8 border-2 border-green-500 bg-black/95 shadow-[0_0_20px_rgba(0,255,0,0.1)]">
+            <h2 class="text-lg font-bold mb-6 text-green-400 flex items-center gap-2">
+                <span>[新規書き込み]</span>
+            </h2>
+            <form id="post-form" class="space-y-5">
+                <div>
+                    <label class="block text-[10px] text-green-800 mb-1">SUBJECT</label>
+                    <input type="text" id="post-title" placeholder="件名を入力してください" required class="w-full bg-black border border-green-900 p-3 text-green-400 focus:outline-none focus:border-green-500 transition">
+                </div>
+                <div>
+                    <label class="block text-[10px] text-green-800 mb-1">MESSAGE_BODY</label>
+                    <textarea id="post-content" rows="5" placeholder="本文を入力してください" required class="w-full bg-black border border-green-900 p-3 text-green-400 focus:outline-none focus:border-green-500 transition"></textarea>
+                </div>
+                <button type="submit" id="submit-btn" class="w-full py-4 border-2 border-green-500 font-bold text-green-400 hover:bg-green-500 hover:text-black transition uppercase tracking-widest">
+                    [ 掲示板に書き込む ]
+                </button>
+            </form>
+        </section>
+    </div>
+
+    <!-- ログイン -->
+    <footer class="mt-auto bg-black/95 border-t border-green-900 py-10 relative z-10">
+        <div class="max-w-md mx-auto px-6">
+            <section id="admin-section" class="flex flex-col items-center">
+                <p class="text-[9px] text-green-900 tracking-[0.5em] mb-4">ADMIN_TERMINAL_V1.0</p>
+                <div class="flex w-full gap-3">
+                    <input type="password" id="admin-password" placeholder="合言葉" class="flex-1 bg-black border border-green-900 px-4 py-2 text-green-500 text-sm focus:outline-none focus:border-green-500 text-center">
+                    <button id="admin-login-btn" class="border-2 border-green-500 px-6 py-2 text-xs font-bold hover:bg-green-500 hover:text-black transition">
+                        認証
+                    </button>
+                </div>
+            </section>
+            <p class="text-center mt-8 text-[8px] text-green-950 tracking-widest">ENCRYPTED CONNECTION : ACTIVE</p>
+        </div>
+    </footer>
+</body>
+</html>
